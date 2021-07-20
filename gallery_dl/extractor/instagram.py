@@ -49,7 +49,7 @@ class InstagramExtractor(Extractor):
             if "__typename" in post:
                 post = self._parse_post_graphql(post)
             else:
-                post = self._parse_post_reel(post)
+                post = self._parse_post_api(post)
             post.update(data)
             files = post.pop("_files")
 
@@ -120,10 +120,7 @@ class InstagramExtractor(Extractor):
         if not self._check_cookies(self.cookienames):
             username, password = self._get_auth_info()
             if username:
-                self.session.cookies.set(
-                    "ig_cb", "2", domain="www.instagram.com")
                 self._update_cookies(self._login_impl(username, password))
-
         self.session.cookies.set(
             "csrftoken", self.csrf_token, domain=self.cookiedomain)
 
@@ -131,33 +128,42 @@ class InstagramExtractor(Extractor):
     def _login_impl(self, username, password):
         self.log.info("Logging in as %s", username)
 
-        page = self.request(self.root + "/accounts/login/").text
+        url = self.root + "/accounts/login/"
+        page = self.request(url).text
+
         headers = {
-            "Referer"         : self.root + "/accounts/login/",
+            "X-Web-Device-Id" : text.extract(page, '"device_id":"', '"')[0],
             "X-IG-App-ID"     : "936619743392459",
+            "X-ASBD-ID"       : "437806",
+            "X-IG-WWW-Claim"  : "0",
             "X-Requested-With": "XMLHttpRequest",
+            "Referer"         : url,
         }
+        url = self.root + "/data/shared_data/"
+        data = self.request(url, headers=headers).json()
 
-        response = self.request(self.root + "/web/__mid/", headers=headers)
-        headers["X-CSRFToken"] = response.cookies["csrftoken"]
-        headers["X-Instagram-AJAX"] = text.extract(
-            page, '"rollout_hash":"', '"')[0]
-
-        url = self.root + "/accounts/login/ajax/"
+        headers["X-CSRFToken"] = data["config"]["csrf_token"]
+        headers["X-Instagram-AJAX"] = data["rollout_hash"]
+        headers["Origin"] = self.root
         data = {
             "username"     : username,
             "enc_password" : "#PWD_INSTAGRAM_BROWSER:0:{}:{}".format(
                 int(time.time()), password),
-            "queryParams"  : "{}",
-            "optIntoOneTap": "false",
+            "queryParams"         : "{}",
+            "optIntoOneTap"       : "false",
+            "stopDeletionNonce"   : "",
+            "trustedDeviceRecords": "{}",
         }
+        url = self.root + "/accounts/login/ajax/"
         response = self.request(url, method="POST", headers=headers, data=data)
 
         if not response.json().get("authenticated"):
             raise exception.AuthenticationError()
+
+        cget = self.session.cookies.get
         return {
-            key: self.session.cookies.get(key)
-            for key in ("sessionid", "mid", "csrftoken")
+            name: cget(name)
+            for name in ("sessionid", "mid", "ig_did")
         }
 
     def _parse_post_graphql(self, post):
@@ -233,16 +239,23 @@ class InstagramExtractor(Extractor):
 
         return data
 
-    def _parse_post_reel(self, post):
+    def _parse_post_api(self, post):
 
         if "media" in post:
             media = post["media"]
             owner = media["user"]
-            post["items"] = (media,)
             data = {
                 "post_id" : media["pk"],
                 "post_shortcode": self._shortcode_from_id(media["pk"]),
             }
+
+            if "carousel_media" in media:
+                post["items"] = media["carousel_media"]
+                data["sidecar_media_id"] = data["post_id"]
+                data["sidecar_shortcode"] = data["post_shortcode"]
+            else:
+                post["items"] = (media,)
+
         else:
             reel_id = str(post["id"]).rpartition(":")[2]
             owner = post["user"]
@@ -273,9 +286,11 @@ class InstagramExtractor(Extractor):
 
             files.append({
                 "num"        : num,
-                "date"       : text.parse_timestamp(item["taken_at"]),
+                "date"       : text.parse_timestamp(item.get("taken_at") or
+                                                    media.get("taken_at")),
                 "media_id"   : item["pk"],
-                "shortcode"  : item["code"],
+                "shortcode"  : (item.get("code") or
+                                self._shortcode_from_id(item["pk"])),
                 "display_url": image["url"],
                 "video_url"  : video["url"] if video else None,
                 "width"      : media["width"],
@@ -408,7 +423,7 @@ class InstagramPostsExtractor(InstagramExtractor):
         url = "{}/{}/".format(self.root, self.item)
         user = self._extract_profile_page(url)
 
-        query_hash = "42d2750e44dbac713ff30130659cd891"
+        query_hash = "7ea6ae3cf6fb05e73fcbe1732b1d2a42"
         variables = {"id": user["id"], "first": 50}
         edge = self._get_edge_data(user, "edge_owner_to_timeline_media")
         return self._pagination_graphql(query_hash, variables, edge)
@@ -427,7 +442,7 @@ class InstagramTaggedExtractor(InstagramExtractor):
         url = "{}/{}/".format(self.root, self.item)
         user = self._extract_profile_page(url)
 
-        query_hash = "31fe64d9463cbbe58319dced405c6206"
+        query_hash = "be13233562af2d229b008d2976b998b5"
         variables = {"id": user["id"], "first": 50}
         edge = self._get_edge_data(user, None)
         return self._pagination_graphql(query_hash, variables, edge)
@@ -479,17 +494,41 @@ class InstagramTagExtractor(InstagramExtractor):
     })
 
     def metadata(self):
-        return {"tag": self.item}
+        return {"tag": text.unquote(self.item)}
 
     def posts(self):
         url = "{}/explore/tags/{}/".format(self.root, self.item)
-        data = self._extract_shared_data(url)
-        hashtag = data["entry_data"]["TagPage"][0]["graphql"]["hashtag"]
+        page = self._extract_shared_data(url)["entry_data"]["TagPage"][0]
 
+        if "data" in page:
+            return self._pagination_sections(page["data"]["recent"])
+
+        hashtag = page["graphql"]["hashtag"]
         query_hash = "9b498c08113f1e09617a1703c22b2f32"
         variables = {"tag_name": hashtag["name"], "first": 50}
         edge = self._get_edge_data(hashtag, "edge_hashtag_to_media")
         return self._pagination_graphql(query_hash, variables, edge)
+
+    def _pagination_sections(self, info):
+        endpoint = "/v1/tags/instagram/sections/"
+        data = {
+            "include_persistent": "0",
+            "max_id" : None,
+            "page"   : None,
+            "surface": "grid",
+            "tab"    : "recent",
+        }
+
+        while True:
+            for section in info["sections"]:
+                yield from section["layout_content"]["medias"]
+
+            if not info.get("more_available"):
+                return
+
+            data["max_id"] = info["next_max_id"]
+            data["page"] = info["next_page"]
+            info = self._request_api(endpoint, method="POST", data=data)
 
     def _pagination_graphql(self, query_hash, variables, data):
         while True:
@@ -613,13 +652,13 @@ class InstagramPostExtractor(InstagramExtractor):
     )
 
     def posts(self):
-        query_hash = "cf28bf5eb45d62d4dc8e77cdb99d750d"
+        query_hash = "1f950d414a6e11c98c556aa007b3157d"
         variables = {
             "shortcode"            : self.item,
             "child_comment_count"  : 3,
             "fetch_comment_count"  : 40,
             "parent_comment_count" : 24,
-            "has_threaded_comments": True
+            "has_threaded_comments": True,
         }
         data = self._request_graphql(query_hash, variables)
         media = data.get("shortcode_media")

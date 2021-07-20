@@ -45,6 +45,13 @@ class ExhentaiExtractor(Extractor):
         Extractor.__init__(self, match)
         self.original = self.config("original", True)
 
+        limits = self.config("limits", False)
+        if limits and limits.__class__ is int:
+            self.limits = limits
+            self._remaining = 0
+        else:
+            self.limits = False
+
         self.session.headers["Referer"] = self.root + "/"
         if version != "ex":
             self.session.cookies.set("nw", "1", domain=self.cookiedomain)
@@ -69,6 +76,7 @@ class ExhentaiExtractor(Extractor):
             self.log.info("no username given; using e-hentai.org")
             self.root = "https://e-hentai.org"
             self.original = False
+            self.limits = False
             self.session.cookies["nw"] = "1"
 
     @cache(maxage=90*24*3600, keyarg=1)
@@ -114,13 +122,13 @@ class ExhentaiGalleryExtractor(ExhentaiExtractor):
                 "date": "dt:2018-03-18 20:15:00",
                 "eh_category": "Non-H",
                 "expunged": False,
-                "favorites": "17",
+                "favorites": "18",
                 "filecount": "4",
                 "filesize": 1488978,
                 "gid": 1200119,
                 "height": int,
                 "image_token": "re:[0-9a-f]{10}",
-                "lang": "jp",
+                "lang": "ja",
                 "language": "Japanese",
                 "parent": "",
                 "rating": r"re:\d\.\d+",
@@ -204,9 +212,13 @@ class ExhentaiGalleryExtractor(ExhentaiExtractor):
             (self.image_from_page(ipage),), self.images_from_api())
         for url, image in images:
             data.update(image)
+            if self.limits:
+                self._check_limits(data)
             if "/fullimg.php" in url:
                 data["extension"] = ""
                 data["_http_validate"] = _validate_response
+            else:
+                data["_http_validate"] = None
             yield Message.Url, url, data
 
     def get_metadata(self, page):
@@ -345,6 +357,26 @@ class ExhentaiGalleryExtractor(ExhentaiExtractor):
             "Image limit reached! "
             "Continue with '%s/s/%s/%s-%s' as URL after resetting it.",
             self.root, data["image_token"], self.gallery_id, data["num"])
+
+    def _check_limits(self, data):
+        if not self._remaining or data["num"] % 25 == 0:
+            self._update_limits()
+        self._remaining -= data["cost"]
+        if self._remaining <= 0:
+            self._report_limits(data)
+
+    def _update_limits(self):
+        url = "https://e-hentai.org/home.php"
+        cookies = {
+            cookie.name: cookie.value
+            for cookie in self.session.cookies
+            if cookie.domain == self.cookiedomain and cookie.name != "igneous"
+        }
+
+        page = self.request(url, cookies=cookies).text
+        current = text.extract(page, "<strong>", "</strong>")[0]
+        self.log.debug("Image Limits: %s/%s", current, self.limits)
+        self._remaining = self.limits - text.parse_int(current)
 
     def _gallery_page(self):
         url = "{}/g/{}/{}/".format(
